@@ -1,0 +1,768 @@
+name: Build EASYPLAY 1s iOS App (Zero-Unzip Standalone)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios:
+    name: Build iOS Native IPA (iPhone 13 Pro Max / iOS 16+)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Select Xcode Stable Version
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Auto-Extract or Generate Full iOS SwiftUI Source (无需解压源码包，单YML自包含)
+        run: |
+          mkdir -p EasyPlay1sSources
+
+          # 1. 如果仓库中直接上传了未解压的 zip 压缩包，自动在云端解压
+          if [ -f "EasyPlay1s_iOS_Native_Xcode.zip" ]; then
+            echo "Found EasyPlay1s_iOS_Native_Xcode.zip, auto-extracting..."
+            unzip -o EasyPlay1s_iOS_Native_Xcode.zip -d ./extracted_zip
+            find ./extracted_zip -name "*.swift" -exec cp {} EasyPlay1sSources/ \;
+          fi
+
+          # 2. 如果仓库中已有 .swift 文件，自动归集；若仅上传了本 yml 文件，则直接写入内嵌的完整 SwiftUI 源码
+          if [ -f "EasyPlay1sPocketKeyboardApp.swift" ]; then
+            cp EasyPlay1sPocketKeyboardApp.swift EasyPlay1sSources/
+          elif [ ! -f "EasyPlay1sSources/EasyPlay1sPocketKeyboardApp.swift" ]; then
+            cat << 'SWIFT_EOF' > EasyPlay1sSources/EasyPlay1sPocketKeyboardApp.swift
+          //
+          //  EasyPlay1sPocketKeyboardApp.swift
+          //  EASYPLAY 1s 口袋音乐键盘 - iOS 原生 App (适配 iPhone 13 Pro Max: 428 × 926 pt, 120Hz ProMotion)
+          //
+          //  功能特性：
+          //  1. 蓝牙 BLE MIDI 双向连接操控：集成 CoreMIDI + CoreAudioKit (CABTMIDICentralViewController)
+          //  2. 25键全音阶与半音布局（复刻图1与图2）：3行×5列大圆键 (1~1̈) + 10颗左上方半音小黑键 (含6左上角5♯)
+          //  3. 左边大旋钮：默认左转减八度 (-2~+2)、右转加八度；按下后旋转切换为移音模式 (-11~+11 半音)
+          //  4. 右边大旋钮：旋转切换图3全部 21 种乐器音色（钢琴、柔和钢琴、小提琴、特色钢片琴、吉他、贝斯、颤音琴、
+          //     手风琴、马林巴、手碟、小号、萨克斯、架子鼓、锯齿波、古筝、琵琶、埙、二胡、唢呐、排箫、禅音）
+          //  5. 内置 8 首经典钢琴曲：支持自动弹奏 (Auto-Play) 与橘色高亮跟弹教学 (Follow-Along Teaching)
+          //
+
+          import SwiftUI
+          import CoreMIDI
+          import CoreAudioKit
+          import AVFoundation
+          import Combine
+
+          @main
+          struct EasyPlay1sPocketKeyboardApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      PocketKeyboardRootView()
+                          .statusBarHidden(false)
+                          .preferredColorScheme(.light)
+                  }
+              }
+          }
+
+          // MARK: - 1. 音符与键盘布局模型（严格对应图1与图2）
+          struct SemitoneKeySpec: Identifiable {
+              let id: Int          // Base MIDI (60..84)
+              let label: String    // 简谱半音标识
+              let noteName: String // 音名
+          }
+
+          struct DiatonicKeySpec: Identifiable {
+              let id: Int          // Base MIDI (60..84)
+              let jianpu: String   // 1..7
+              let dotsAbove: Int   // 0, 1, 2
+              let noteName: String // C4..C6
+              let isDarkGreen: Bool
+              let semitoneUpperLeft: SemitoneKeySpec?
+          }
+
+          struct TimbreSpec: Identifiable {
+              let id: Int
+              let name: String
+              let icon: String
+              let gmProgram: UInt8
+              let category: String
+          }
+
+          struct SongNoteStep: Identifiable {
+              let id = UUID()
+              let midi: Int
+              let beats: Double
+          }
+
+          struct ClassicSong: Identifiable {
+              let id: Int
+              let title: String
+              let bpm: Double
+              let steps: [SongNoteStep]
+          }
+
+          // MARK: - 2. 核心音频合成、蓝牙 MIDI 与教学状态引擎
+          @MainActor
+          final class PocketSynthViewModel: ObservableObject {
+              // 左旋钮状态：默认八度 (-2...+2)，按下后旋转为移音 (-11...+11 半音)
+              @Published var octaveShift: Int = 0
+              @Published var transposeSemitones: Int = 0
+              @Published var isLeftKnobPressed: Bool = false
+              @Published var leftKnobAngle: Double = 0
+
+              // 右旋钮状态：21种音色选择
+              @Published var selectedTimbreIndex: Int = 0
+              @Published var rightKnobAngle: Double = 0
+
+              // 琴键高亮与跟弹教学状态
+              @Published var activeMidiNotes: Set<Int> = []
+              @Published var currentDisplayedNote: String = "--"
+              @Published var selectedSongIndex: Int = 0
+              @Published var isAutoPlaying: Bool = false
+              @Published var isFollowTeachingMode: Bool = false
+              @Published var isStrictFollowMode: Bool = true
+              @Published var followStepIndex: Int = 0
+              @Published var followCombo: Int = 0
+              @Published var tempoMultiplier: Double = 1.0
+
+              // 蓝牙 MIDI 状态
+              @Published var bleMidiConnected: Bool = false
+              @Published var midiStatusText: String = "蓝牙 MIDI 待机"
+              @Published var showBluetoothMidiSheet: Bool = false
+              @Published var showTimbreGridSheet: Bool = false
+
+              // AVAudioEngine 合成器
+              private let audioEngine = AVAudioEngine()
+              private let sampler = AVAudioUnitSampler()
+              private var autoPlayTask: Task<Void, Never>?
+
+              // CoreMIDI 客户端与端口
+              private var midiClient = MIDIClientRef()
+              private var midiInputPort = MIDIPortRef()
+
+              // 图2 完整 3×5 大键 + 10 颗左上方小黑键布局
+              let rows: [[DiatonicKeySpec]] = [
+                  // 第1行: 1, 2, 3, 4, 5 (C4 ~ G4)
+                  [
+                      DiatonicKeySpec(id: 60, jianpu: "1", dotsAbove: 0, noteName: "C4", isDarkGreen: false, semitoneUpperLeft: nil),
+                      DiatonicKeySpec(id: 62, jianpu: "2", dotsAbove: 0, noteName: "D4", isDarkGreen: true,  semitoneUpperLeft: SemitoneKeySpec(id: 61, label: "1♯", noteName: "C♯4")),
+                      DiatonicKeySpec(id: 64, jianpu: "3", dotsAbove: 0, noteName: "E4", isDarkGreen: false, semitoneUpperLeft: SemitoneKeySpec(id: 63, label: "2♯", noteName: "D♯4")),
+                      DiatonicKeySpec(id: 65, jianpu: "4", dotsAbove: 0, noteName: "F4", isDarkGreen: true,  semitoneUpperLeft: nil),
+                      DiatonicKeySpec(id: 67, jianpu: "5", dotsAbove: 0, noteName: "G4", isDarkGreen: false, semitoneUpperLeft: SemitoneKeySpec(id: 66, label: "4♯", noteName: "F♯4"))
+                  ],
+                  // 第2行: 6, 7, 1̇, 2̇, 3̇ (A4 ~ E5)，注意 5♯ 位于 6 的左上方
+                  [
+                      DiatonicKeySpec(id: 69, jianpu: "6", dotsAbove: 0, noteName: "A4", isDarkGreen: true,  semitoneUpperLeft: SemitoneKeySpec(id: 68, label: "5♯", noteName: "G♯4")),
+                      DiatonicKeySpec(id: 71, jianpu: "7", dotsAbove: 0, noteName: "B4", isDarkGreen: false, semitoneUpperLeft: SemitoneKeySpec(id: 70, label: "6♯", noteName: "A♯4")),
+                      DiatonicKeySpec(id: 72, jianpu: "1", dotsAbove: 1, noteName: "C5", isDarkGreen: true,  semitoneUpperLeft: nil),
+                      DiatonicKeySpec(id: 74, jianpu: "2", dotsAbove: 1, noteName: "D5", isDarkGreen: false, semitoneUpperLeft: SemitoneKeySpec(id: 73, label: "1̇♯", noteName: "C♯5")),
+                      DiatonicKeySpec(id: 76, jianpu: "3", dotsAbove: 1, noteName: "E5", isDarkGreen: true,  semitoneUpperLeft: SemitoneKeySpec(id: 75, label: "2̇♯", noteName: "D♯5"))
+                  ],
+                  // 第3行: 4̇, 5̇, 6̇, 7̇, 1̈ (F5 ~ C6)
+                  [
+                      DiatonicKeySpec(id: 77, jianpu: "4", dotsAbove: 1, noteName: "F5", isDarkGreen: false, semitoneUpperLeft: nil),
+                      DiatonicKeySpec(id: 79, jianpu: "5", dotsAbove: 1, noteName: "G5", isDarkGreen: true,  semitoneUpperLeft: SemitoneKeySpec(id: 78, label: "4̇♯", noteName: "F♯5")),
+                      DiatonicKeySpec(id: 81, jianpu: "6", dotsAbove: 1, noteName: "A5", isDarkGreen: false, semitoneUpperLeft: SemitoneKeySpec(id: 80, label: "5̇♯", noteName: "G♯5")),
+                      DiatonicKeySpec(id: 83, jianpu: "7", dotsAbove: 1, noteName: "B5", isDarkGreen: true,  semitoneUpperLeft: SemitoneKeySpec(id: 82, label: "6̇♯", noteName: "A♯5")),
+                      DiatonicKeySpec(id: 84, jianpu: "1", dotsAbove: 2, noteName: "C6", isDarkGreen: false, semitoneUpperLeft: nil)
+                  ]
+              ]
+
+              // 图3 全部 21 种原厂音色
+              let timbres: [TimbreSpec] = [
+                  TimbreSpec(id: 0,  name: "钢琴",       icon: "🎹", gmProgram: 0,   category: "键盘"),
+                  TimbreSpec(id: 1,  name: "柔和钢琴",   icon: "🎼", gmProgram: 1,   category: "键盘"),
+                  TimbreSpec(id: 2,  name: "小提琴",     icon: "🎻", gmProgram: 40,  category: "弦乐"),
+                  TimbreSpec(id: 3,  name: "特色钢片琴", icon: "🔔", gmProgram: 8,   category: "打击"),
+                  TimbreSpec(id: 4,  name: "吉他",       icon: "🎸", gmProgram: 24,  category: "拨弦"),
+                  TimbreSpec(id: 5,  name: "贝斯",       icon: "🎵", gmProgram: 32,  category: "低音"),
+                  TimbreSpec(id: 6,  name: "颤音琴",     icon: "✨", gmProgram: 11,  category: "打击"),
+                  TimbreSpec(id: 7,  name: "手风琴",     icon: "🪗", gmProgram: 21,  category: "簧片"),
+                  TimbreSpec(id: 8,  name: "马林巴",     icon: "🪵", gmProgram: 12,  category: "打击"),
+                  TimbreSpec(id: 9,  name: "手碟",       icon: "🛸", gmProgram: 114, category: "空灵"),
+                  TimbreSpec(id: 10, name: "小号",       icon: "🎺", gmProgram: 56,  category: "铜管"),
+                  TimbreSpec(id: 11, name: "萨克斯",     icon: "🎷", gmProgram: 65,  category: "木管"),
+                  TimbreSpec(id: 12, name: "架子鼓",     icon: "🥁", gmProgram: 118, category: "打击"),
+                  TimbreSpec(id: 13, name: "锯齿波",     icon: "⚡", gmProgram: 81,  category: "合成"),
+                  TimbreSpec(id: 14, name: "古筝",       icon: "🏮", gmProgram: 107, category: "民乐"),
+                  TimbreSpec(id: 15, name: "琵琶",       icon: "🪕", gmProgram: 105, category: "民乐"),
+                  TimbreSpec(id: 16, name: "埙",         icon: "🏺", gmProgram: 79,  category: "民乐"),
+                  TimbreSpec(id: 17, name: "二胡",       icon: "🎶", gmProgram: 110, category: "民乐"),
+                  TimbreSpec(id: 18, name: "唢呐",       icon: "📯", gmProgram: 111, category: "民乐"),
+                  TimbreSpec(id: 19, name: "排箫",       icon: "🎋", gmProgram: 75,  category: "民乐"),
+                  TimbreSpec(id: 20, name: "禅音",       icon: "🧘", gmProgram: 14,  category: "冥想")
+              ]
+
+              // 内置 8 首经典钢琴曲
+              let songs: [ClassicSong] = [
+                  ClassicSong(id: 0, title: "01. 致爱丽丝 (Für Elise)", bpm: 125, steps: [
+                      .init(midi: 76, beats: 0.5), .init(midi: 75, beats: 0.5), .init(midi: 76, beats: 0.5),
+                      .init(midi: 75, beats: 0.5), .init(midi: 76, beats: 0.5), .init(midi: 71, beats: 0.5),
+                      .init(midi: 74, beats: 0.5), .init(midi: 72, beats: 0.5), .init(midi: 69, beats: 1.5),
+                      .init(midi: 60, beats: 0.5), .init(midi: 64, beats: 0.5), .init(midi: 69, beats: 0.5),
+                      .init(midi: 71, beats: 1.5), .init(midi: 64, beats: 0.5), .init(midi: 72, beats: 0.5),
+                      .init(midi: 71, beats: 0.5), .init(midi: 69, beats: 2.0)
+                  ]),
+                  ClassicSong(id: 1, title: "02. D大调卡农 (Canon in D)", bpm: 100, steps: [
+                      .init(midi: 76, beats: 1.0), .init(midi: 74, beats: 1.0), .init(midi: 72, beats: 1.0),
+                      .init(midi: 71, beats: 1.0), .init(midi: 69, beats: 1.0), .init(midi: 67, beats: 1.0),
+                      .init(midi: 69, beats: 1.0), .init(midi: 71, beats: 1.0), .init(midi: 72, beats: 1.5)
+                  ]),
+                  ClassicSong(id: 2, title: "03. 小星星变奏曲 (Twinkle Star)", bpm: 115, steps: [
+                      .init(midi: 60, beats: 0.7), .init(midi: 60, beats: 0.7), .init(midi: 67, beats: 0.7),
+                      .init(midi: 67, beats: 0.7), .init(midi: 69, beats: 0.7), .init(midi: 69, beats: 0.7),
+                      .init(midi: 67, beats: 1.4), .init(midi: 65, beats: 0.7), .init(midi: 65, beats: 0.7),
+                      .init(midi: 64, beats: 0.7), .init(midi: 64, beats: 0.7), .init(midi: 62, beats: 0.7),
+                      .init(midi: 62, beats: 0.7), .init(midi: 60, beats: 1.4)
+                  ]),
+                  ClassicSong(id: 3, title: "04. 欢乐颂 (Ode to Joy)", bpm: 120, steps: [
+                      .init(midi: 64, beats: 0.7), .init(midi: 64, beats: 0.7), .init(midi: 65, beats: 0.7),
+                      .init(midi: 67, beats: 0.7), .init(midi: 67, beats: 0.7), .init(midi: 65, beats: 0.7),
+                      .init(midi: 64, beats: 0.7), .init(midi: 62, beats: 0.7), .init(midi: 60, beats: 0.7),
+                      .init(midi: 60, beats: 0.7), .init(midi: 62, beats: 0.7), .init(midi: 64, beats: 0.7),
+                      .init(midi: 62, beats: 1.0), .init(midi: 60, beats: 1.5)
+                  ]),
+                  ClassicSong(id: 4, title: "05. 梦中的婚礼 (Mariage d'Amour)", bpm: 112, steps: [
+                      .init(midi: 69, beats: 0.5), .init(midi: 72, beats: 0.5), .init(midi: 76, beats: 0.5),
+                      .init(midi: 81, beats: 1.2), .init(midi: 79, beats: 0.8), .init(midi: 76, beats: 0.5),
+                      .init(midi: 74, beats: 1.2)
+                  ]),
+                  ClassicSong(id: 5, title: "06. 天鹅湖主题曲 (Swan Lake)", bpm: 108, steps: [
+                      .init(midi: 76, beats: 1.4), .init(midi: 69, beats: 0.5), .init(midi: 71, beats: 0.5),
+                      .init(midi: 72, beats: 0.5), .init(midi: 74, beats: 0.5), .init(midi: 76, beats: 1.2),
+                      .init(midi: 72, beats: 0.6), .init(midi: 76, beats: 1.5)
+                  ]),
+                  ClassicSong(id: 6, title: "07. 月光奏鸣曲 (Moonlight Sonata)", bpm: 95, steps: [
+                      .init(midi: 61, beats: 0.6), .init(midi: 64, beats: 0.6), .init(midi: 68, beats: 0.6),
+                      .init(midi: 61, beats: 0.6), .init(midi: 64, beats: 0.6), .init(midi: 68, beats: 0.6),
+                      .init(midi: 61, beats: 0.6), .init(midi: 66, beats: 0.6), .init(midi: 69, beats: 1.2)
+                  ]),
+                  ClassicSong(id: 7, title: "08. 天空之城 (Carrying You)", bpm: 108, steps: [
+                      .init(midi: 69, beats: 0.5), .init(midi: 71, beats: 0.5), .init(midi: 72, beats: 1.2),
+                      .init(midi: 71, beats: 0.5), .init(midi: 72, beats: 0.8), .init(midi: 76, beats: 0.8),
+                      .init(midi: 71, beats: 1.6)
+                  ])
+              ]
+
+              init() {
+                  setupAudioEngine()
+                  setupCoreMIDI()
+              }
+
+              private func setupAudioEngine() {
+                  audioEngine.attach(sampler)
+                  audioEngine.connect(sampler, to: audioEngine.mainMixerNode, format: nil)
+                  try? audioEngine.start()
+              }
+
+              private func setupCoreMIDI() {
+                  MIDIClientCreateWithBlock("EasyPlay1s_iOS_MIDIClient" as CFString, &midiClient) { [weak self] _ in
+                      Task { @MainActor in
+                          self?.connectAllMIDISources()
+                      }
+                  }
+                  MIDIInputPortCreateWithProtocol(
+                      midiClient,
+                      "EasyPlay1s_InputPort" as CFString,
+                      ._1_0,
+                      &midiInputPort
+                  ) { [weak self] eventList, _ in
+                      let packet = eventList.pointee.packet
+                      let word = packet.words.0
+                      let status = UInt8((word >> 16) & 0xFF)
+                      let data1 = UInt8((word >> 8) & 0x7F)
+                      let data2 = UInt8(word & 0x7F)
+                      Task { @MainActor in
+                          self?.handleIncomingMIDI(status: status, data1: data1, data2: data2)
+                      }
+                  }
+                  connectAllMIDISources()
+              }
+
+              func connectAllMIDISources() {
+                  let sourceCount = MIDIGetNumberOfSources()
+                  for idx in 0..<sourceCount {
+                      let src = MIDIGetSource(idx)
+                      MIDIPortConnectSource(midiInputPort, src, nil)
+                  }
+                  bleMidiConnected = sourceCount > 0
+                  midiStatusText = bleMidiConnected ? "已连接 (\(sourceCount) 台蓝牙 MIDI)" : "蓝牙 MIDI 待机"
+              }
+
+              private func handleIncomingMIDI(status: UInt8, data1: UInt8, data2: UInt8) {
+                  let command = status & 0xF0
+                  if command == 0x90 && data2 > 0 {
+                      let baseMidi = min(max(Int(data1), 60), 84)
+                      triggerNote(baseMidi: baseMidi, velocity: data2, isFromAutoPlay: false)
+                  } else if command == 0xB0 {
+                      // CC#14 控制左大旋钮，CC#15 控制右大旋钮
+                      if data1 == 14 {
+                          rotateLeftKnob(step: data2 >= 64 ? 1 : -1)
+                      } else if data1 == 15 {
+                          let targetIdx = Int((Double(data2) / 127.0) * Double(timbres.count - 1))
+                          selectTimbre(index: targetIdx)
+                      }
+                  }
+              }
+
+              // MARK: - 左旋钮：默认八度 / 按下旋转移音
+              func rotateLeftKnob(step: Int) {
+                  UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                  leftKnobAngle += Double(step) * 28.0
+                  if isLeftKnobPressed {
+                      transposeSemitones = min(max(transposeSemitones + step, -11), 11)
+                  } else {
+                      octaveShift = min(max(octaveShift + step, -2), 2)
+                  }
+              }
+
+              func toggleLeftKnobPress() {
+                  UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                  isLeftKnobPressed.toggle()
+              }
+
+              // MARK: - 右旋钮：切换21种音色
+              func selectTimbre(index: Int) {
+                  let count = timbres.count
+                  selectedTimbreIndex = ((index % count) + count) % count
+                  rightKnobAngle = Double(selectedTimbreIndex) * 18.0
+                  UIImpactFeedbackGenerator(style: .rigid).impactOccurred()
+                  sampler.sendProgramChange(timbres[selectedTimbreIndex].gmProgram, onChannel: 0)
+              }
+
+              // MARK: - 琴键触发与跟弹判定
+              func triggerNote(baseMidi: Int, velocity: UInt8 = 108, isFromAutoPlay: Bool = false) {
+                  let effectiveMidi = UInt8(min(max(baseMidi + octaveShift * 12 + transposeSemitones, 24), 108))
+                  sampler.startNote(effectiveMidi, withVelocity: velocity, onChannel: 0)
+                  currentDisplayedNote = "MIDI \(effectiveMidi)"
+                  activeMidiNotes.insert(baseMidi)
+
+                  Task {
+                      try? await Task.sleep(nanoseconds: 240_000_000)
+                      activeMidiNotes.remove(baseMidi)
+                      sampler.stopNote(effectiveMidi, onChannel: 0)
+                  }
+
+                  // 跟弹教学模式判定
+                  if isFollowTeachingMode && !isFromAutoPlay {
+                      let currentSong = songs[selectedSongIndex]
+                      let targetMidi = currentSong.steps[followStepIndex].midi
+                      if !isStrictFollowMode || baseMidi == targetMidi {
+                          followCombo += 1
+                          followStepIndex = (followStepIndex + 1) % currentSong.steps.count
+                      } else {
+                          followCombo = 0
+                      }
+                  }
+              }
+
+              var currentGuideTargetMidi: Int? {
+                  guard isFollowTeachingMode else { return nil }
+                  return songs[selectedSongIndex].steps[followStepIndex].midi
+              }
+
+              // MARK: - 自动弹奏引擎
+              func toggleAutoPlay() {
+                  if isAutoPlaying {
+                      stopAutoPlay()
+                  } else {
+                      isFollowTeachingMode = false
+                      isAutoPlaying = true
+                      let song = songs[selectedSongIndex]
+                      autoPlayTask = Task {
+                          var idx = 0
+                          while !Task.isCancelled && isAutoPlaying {
+                              let step = song.steps[idx]
+                              triggerNote(baseMidi: step.midi, velocity: 105, isFromAutoPlay: true)
+                              let durationSeconds = (60.0 / song.bpm) * step.beats / tempoMultiplier
+                              try? await Task.sleep(nanoseconds: UInt64(max(durationSeconds, 0.12) * 1_000_000_000))
+                              idx = (idx + 1) % song.steps.count
+                          }
+                      }
+                  }
+              }
+
+              func stopAutoPlay() {
+                  isAutoPlaying = false
+                  autoPlayTask?.cancel()
+                  autoPlayTask = nil
+              }
+          }
+
+          // MARK: - 3. CoreAudioKit 原生 iOS 蓝牙 BLE MIDI 配对弹窗封装
+          struct BluetoothMIDICentralSheet: UIViewControllerRepresentable {
+              func makeUIViewController(context: Context) -> UINavigationController {
+                  let btController = CABTMIDICentralViewController()
+                  return UINavigationController(rootViewController: btController)
+              }
+              func updateUIViewController(_ uiViewController: UINavigationController, context: Context) {}
+          }
+
+          // MARK: - 4. 主界面视图 (适配 iPhone 13 Pro Max 428 × 926 pt)
+          struct PocketKeyboardRootView: View {
+              @StateObject private var vm = PocketSynthViewModel()
+
+              var body: some View {
+                  ZStack {
+                      LinearGradient(
+                          colors: [Color(red: 0.90, green: 0.97, blue: 0.88), Color(red: 0.80, green: 0.93, blue: 0.77)],
+                          startPoint: .topLeading,
+                          endPoint: .bottomTrailing
+                      )
+                      .ignoresSafeArea()
+
+                      VStack(spacing: 10) {
+                          // 顶部状态栏与曲库/教学控制栏
+                          topControlBar
+
+                          // 口袋键盘硬件主壳体（左旋钮 + 25键矩阵 + 右旋钮）
+                          HStack(spacing: 16) {
+                              leftRotaryKnobPanel
+                              centerKeyboardMatrix
+                              rightRotaryKnobPanel
+                          }
+                          .padding(16)
+                          .background(
+                              RoundedRectangle(cornerRadius: 28, style: .continuous)
+                                  .fill(Color(red: 0.78, green: 0.92, blue: 0.74))
+                                  .shadow(color: Color.green.opacity(0.28), radius: 14, x: 0, y: 8)
+                          )
+                          .padding(.horizontal, 12)
+                      }
+                      .padding(.vertical, 8)
+                  }
+                  .sheet(isPresented: $vm.showBluetoothMidiSheet, onDismiss: {
+                      vm.connectAllMIDISources()
+                  }) {
+                      BluetoothMIDICentralSheet()
+                  }
+              }
+
+              private var topControlBar: some View {
+                  HStack(spacing: 12) {
+                      Button {
+                          vm.showBluetoothMidiSheet = true
+                      } label: {
+                          Label(vm.midiStatusText, systemImage: "antenna.radiowaves.left.and.right")
+                              .font(.system(size: 12, weight: .bold))
+                              .padding(.horizontal, 10)
+                              .padding(.vertical, 6)
+                              .background(Color.blue)
+                              .foregroundColor(.white)
+                              .clipShape(Capsule())
+                      }
+
+                      Picker("内置8首经典钢琴曲", selection: $vm.selectedSongIndex) {
+                          ForEach(vm.songs) { song in
+                              Text(song.title).tag(song.id)
+                          }
+                      }
+                      .pickerStyle(.menu)
+                      .font(.system(size: 12, weight: .bold))
+
+                      Button {
+                          vm.toggleAutoPlay()
+                      } label: {
+                          Text(vm.isAutoPlaying ? "⏸ 暂停弹奏" : "▶ 自动弹奏")
+                              .font(.system(size: 12, weight: .bold))
+                              .padding(.horizontal, 12)
+                              .padding(.vertical, 6)
+                              .background(Color.orange)
+                              .foregroundColor(.white)
+                              .clipShape(Capsule())
+                      }
+
+                      Button {
+                          vm.stopAutoPlay()
+                          vm.isFollowTeachingMode.toggle()
+                          vm.followStepIndex = 0
+                      } label: {
+                          Text(vm.isFollowTeachingMode ? "橘色跟弹: 开启 (连击 \(vm.followCombo))" : "跟弹教学")
+                              .font(.system(size: 12, weight: .bold))
+                              .padding(.horizontal, 12)
+                              .padding(.vertical, 6)
+                              .background(vm.isFollowTeachingMode ? Color.red : Color.white.opacity(0.85))
+                              .foregroundColor(vm.isFollowTeachingMode ? .white : .primary)
+                              .clipShape(Capsule())
+                      }
+                  }
+                  .padding(.horizontal, 16)
+              }
+
+              private var leftRotaryKnobPanel: some View {
+                  VStack(spacing: 8) {
+                      Text(vm.isLeftKnobPressed ? "已按下: 移音(\(vm.transposeSemitones) ST)" : "默认: 八度(\(vm.octaveShift))")
+                          .font(.system(size: 11, weight: .heavy))
+                          .padding(.horizontal, 8)
+                          .padding(.vertical, 3)
+                          .background(vm.isLeftKnobPressed ? Color.orange : Color.green.opacity(0.85))
+                          .foregroundColor(.white)
+                          .clipShape(Capsule())
+
+                      HStack(spacing: 8) {
+                          Button("↺") { vm.rotateLeftKnob(step: -1) }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.green)
+
+                          Circle()
+                              .fill(Color(red: 0.61, green: 0.89, blue: 0.49))
+                              .frame(width: 86, height: 86)
+                              .overlay(
+                                  VStack(spacing: 2) {
+                                      Text(vm.isLeftKnobPressed ? "TRANSPOSE" : "OCTAVE")
+                                          .font(.system(size: 10, weight: .black))
+                                      Text(vm.isLeftKnobPressed ? "\(vm.transposeSemitones)" : "\(vm.octaveShift)")
+                                          .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                      Text("点击切换")
+                                          .font(.system(size: 9))
+                                  }
+                              )
+                              .onTapGesture {
+                                  vm.toggleLeftKnobPress()
+                              }
+
+                          Button("↻") { vm.rotateLeftKnob(step: 1) }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.green)
+                      }
+                  }
+              }
+
+              private var centerKeyboardMatrix: some View {
+                  VStack(spacing: 14) {
+                      ForEach(0..<vm.rows.count, id: \.self) { rowIdx in
+                          HStack(spacing: 14) {
+                              ForEach(vm.rows[rowIdx]) { keySpec in
+                                  ZStack(alignment: .topLeading) {
+                                      // 大圆琴键
+                                      Button {
+                                          vm.triggerNote(baseMidi: keySpec.id)
+                                      } label: {
+                                          VStack(spacing: 1) {
+                                              if keySpec.dotsAbove > 0 {
+                                                  Text(String(repeating: "•", count: keySpec.dotsAbove))
+                                                      .font(.system(size: 8, weight: .black))
+                                              }
+                                              Text(keySpec.jianpu)
+                                                  .font(.system(size: 20, weight: .heavy))
+                                              Text(keySpec.noteName)
+                                                  .font(.system(size: 9, weight: .semibold))
+                                                  .opacity(0.7)
+                                          }
+                                          .frame(width: 56, height: 56)
+                                          .background(keyBackgroundColor(for: keySpec))
+                                          .foregroundColor(.primary)
+                                          .clipShape(Circle())
+                                          .overlay(
+                                              Circle()
+                                                  .stroke(
+                                                      vm.currentGuideTargetMidi == keySpec.id ? Color.orange : Color.white.opacity(0.8),
+                                                      lineWidth: vm.currentGuideTargetMidi == keySpec.id ? 3.5 : 1.5
+                                                  )
+                                          )
+                                      }
+
+                                      // 左上方小黑键（半音）
+                                      if let semi = keySpec.semitoneUpperLeft {
+                                          Button {
+                                              vm.triggerNote(baseMidi: semi.id)
+                                          } label: {
+                                              Text(semi.label)
+                                                  .font(.system(size: 9, weight: .bold))
+                                                  .frame(width: 28, height: 28)
+                                                  .background(
+                                                      vm.activeMidiNotes.contains(semi.id) || vm.currentGuideTargetMidi == semi.id
+                                                          ? Color.orange
+                                                          : Color(red: 0.72, green: 0.90, blue: 0.68)
+                                                  )
+                                                  .clipShape(Circle())
+                                          }
+                                          .offset(x: -12, y: -14)
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+                  .padding(18)
+                  .background(
+                      RoundedRectangle(cornerRadius: 24, style: .continuous)
+                          .fill(Color(red: 0.84, green: 0.95, blue: 0.81))
+                  )
+              }
+
+              private func keyBackgroundColor(for keySpec: DiatonicKeySpec) -> Color {
+                  if vm.activeMidiNotes.contains(keySpec.id) || vm.currentGuideTargetMidi == keySpec.id {
+                      return Color.orange.opacity(0.88)
+                  }
+                  return keySpec.isDarkGreen
+                      ? Color(red: 0.59, green: 0.87, blue: 0.47)
+                      : Color(red: 0.86, green: 0.96, blue: 0.84)
+              }
+
+              private var rightRotaryKnobPanel: some View {
+                  let currentTimbre = vm.timbres[vm.selectedTimbreIndex]
+                  return VStack(spacing: 8) {
+                      Text("音色: \(currentTimbre.name) (\(vm.selectedTimbreIndex + 1)/21)")
+                          .font(.system(size: 11, weight: .heavy))
+                          .padding(.horizontal, 8)
+                          .padding(.vertical, 3)
+                          .background(Color.green.opacity(0.85))
+                          .foregroundColor(.white)
+                          .clipShape(Capsule())
+
+                      HStack(spacing: 8) {
+                          Button("↺") { vm.selectTimbre(index: vm.selectedTimbreIndex - 1) }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.green)
+
+                          Circle()
+                              .fill(Color(red: 0.61, green: 0.89, blue: 0.49))
+                              .frame(width: 86, height: 86)
+                              .overlay(
+                                  VStack(spacing: 2) {
+                                      Text(currentTimbre.icon)
+                                          .font(.system(size: 20))
+                                      Text(currentTimbre.name)
+                                          .font(.system(size: 12, weight: .bold))
+                                      Text("旋转切换")
+                                          .font(.system(size: 9))
+                                  }
+                              )
+
+                          Button("↻") { vm.selectTimbre(index: vm.selectedTimbreIndex + 1) }
+                              .buttonStyle(.borderedProminent)
+                              .tint(.green)
+                      }
+                  }
+              }
+          }
+          SWIFT_EOF
+          fi
+
+          # 3. 自动生成蓝牙 MIDI 权限配置 Info.plist
+          cat << 'PLIST_EOF' > Info.plist
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleDisplayName</key>
+              <string>EASYPLAY 1s</string>
+              <key>CFBundleExecutable</key>
+              <string>$(EXECUTABLE_NAME)</string>
+              <key>CFBundleIdentifier</key>
+              <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+              <key>CFBundleInfoDictionaryVersion</key>
+              <string>6.0</string>
+              <key>CFBundleName</key>
+              <string>$(PRODUCT_NAME)</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0.0</string>
+              <key>CFBundleVersion</key>
+              <string>1</string>
+              <key>LSRequiresIPhoneOS</key>
+              <true/>
+              <key>NSBluetoothAlwaysUsageDescription</key>
+              <string>用于扫描并连接 EASYPLAY 1s 及外部蓝牙 BLE MIDI 键盘进行双向演奏控制</string>
+              <key>NSBluetoothPeripheralUsageDescription</key>
+              <string>用于蓝牙 BLE MIDI 无线乐器连接与低延迟演奏控制</string>
+              <key>UIApplicationSceneManifest</key>
+              <dict>
+                  <key>UIApplicationSupportsMultipleScenes</key>
+                  <false/>
+              </dict>
+              <key>UILaunchScreen</key>
+              <dict/>
+              <key>UISupportedInterfaceOrientations</key>
+              <array>
+                  <string>UIInterfaceOrientationLandscapeLeft</string>
+                  <string>UIInterfaceOrientationLandscapeRight</string>
+                  <string>UIInterfaceOrientationPortrait</string>
+              </array>
+          </dict>
+          </plist>
+          PLIST_EOF
+
+          # 4. 自动生成 XcodeGen 工程描述文件 project.yml
+          cat << 'XCODEGEN_EOF' > project.yml
+          name: EasyPlay1s
+          options:
+            bundleIdPrefix: com.summer.easyplay1s
+            deploymentTarget:
+              iOS: "16.0"
+          settings:
+            base:
+              SWIFT_VERSION: "5.9"
+              TARGETED_DEVICE_FAMILY: "1,2"
+              INFOPLIST_FILE: Info.plist
+              PRODUCT_BUNDLE_IDENTIFIER: com.summer.easyplay1s.ios
+              MARKETING_VERSION: "1.0.0"
+              CURRENT_PROJECT_VERSION: "1"
+          targets:
+            EasyPlay1s:
+              type: application
+              platform: iOS
+              sources:
+                - path: EasyPlay1sSources
+              dependencies:
+                - sdk: CoreMIDI.framework
+                - sdk: CoreAudioKit.framework
+                - sdk: AVFoundation.framework
+          XCODEGEN_EOF
+
+      - name: Generate Xcode Project via XcodeGen
+        run: |
+          if ! command -v xcodegen &> /dev/null; then
+            brew install xcodegen
+          fi
+          xcodegen generate
+
+      - name: Build Unsigned Release App for iPhone 13 Pro Max (arm64)
+        run: |
+          xcodebuild clean build \
+            -project EasyPlay1s.xcodeproj \
+            -scheme EasyPlay1s \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES
+
+      - name: Package IPA Archive
+        run: |
+          mkdir -p output/Payload
+          APP_PATH=$(find build -name "EasyPlay1s.app" -type d | head -n 1)
+          cp -R "$APP_PATH" output/Payload/
+          cd output
+          zip -r9 EasyPlay1s-iPhone13ProMax-Unsigned.ipa Payload
+          ls -lh EasyPlay1s-iPhone13ProMax-Unsigned.ipa
+
+      - name: Publish Direct Downloadable IPA to GitHub Releases (无需二次解压直接下载 .ipa)
+        uses: softprops/action-gh-release@v2
+        if: github.event_name != 'pull_request'
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: "EASYPLAY 1s iOS Pro Max v1.0.${{ github.run_number }} (直链下载 .ipa)"
+          body: "自动编译完成：直接点击下方 `EasyPlay1s-iPhone13ProMax-Unsigned.ipa` 即可下载安装包（无需解压），支持通过 AltStore / Sideloadly / TrollStore / 爱思助手签名安装至 iPhone 13 Pro Max。"
+          files: output/EasyPlay1s-iPhone13ProMax-Unsigned.ipa
+          prerelease: false
+
+      - name: Upload Artifact Backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: EasyPlay1s-iOS-IPA
+          path: output/EasyPlay1s-iPhone13ProMax-Unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
